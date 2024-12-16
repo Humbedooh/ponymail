@@ -90,12 +90,17 @@ function handle(r)
         return cross.OK
     end
     -- emailsOnly: return email summaries only, not derived data:
-    -- i.e. omit thread_struct, top 10 participants and word-cloud   
+    -- i.e. omit thread_struct, top 10 participants and word-cloud
     local emailsOnly = get.emailsOnly
     local qs = "*" -- positive query
     local nqs = "" -- negative query
     local dd = "lte=1M"
     local maxresults = config.maxResults or 5000
+    -- Param: page=n (page number, starts at 1)
+    -- Param: per_page=n (results per page, max 5000)
+    local page = math.max(tonumber(get.page) or 1, 1)
+    local per_page = math.min(tonumber(get.per_page) or 100, maxresults)
+    local offset = (page - 1) * per_page
     local account = user.get(r)
     -- Param: d=nnnnn (numeric)
     -- does not appear to be supported below
@@ -111,7 +116,7 @@ function handle(r)
             local y = {}
             local z = {}
             local words = {}
-            
+
             -- first, grab all "foo bar" quotes
             for lword in q:gmatch([[("[^"]+")]]) do
                 table.insert(words, lword)
@@ -120,12 +125,12 @@ function handle(r)
             for _, word in pairs(words) do
                 q = q:gsub('"' .. word:gsub('[.%-%%%?%+]', "%%%1") .. '"', "")
             end
-            
+
             -- then remaining single words
             for word in q:gmatch("(%S+)") do
                 table.insert(words, word)
             end
-            
+
             for _, word in pairs(words) do
                 local preface = ""
                 if word:match("^%-") then
@@ -151,7 +156,7 @@ function handle(r)
         end
         nqs = table.concat(nx, " OR ")
     end
-    
+
     local listraw = "<" .. get.list .. "." .. get.domain .. ">"
     local listdata = {
         name = get.list,
@@ -176,13 +181,13 @@ function handle(r)
             qs = table.concat(z, " AND ")
         end
     end
-    
+
     -- Debug time point 1
     if DEBUG then
       table.insert(t, r:clock() - tnow)
       tnow = r:clock()
     end
-    
+
     local daterange = {gt = "now-1M", lte = "now+1d" }
     -- Param: dfrom=.*ddd (days ago to start)
     -- Param: dto=dddd.* (total days to match)
@@ -203,7 +208,7 @@ function handle(r)
     if not get.d then
         get.d = dd
     end
-    
+
     -- d=YYYY-mm translates into s+e being equal to d
     -- Param: d=yyyy-mm
     if not (get.s and get.e) and get.d and get.d:match("^%d+%-%d+$") then
@@ -254,7 +259,7 @@ function handle(r)
         local em = tonumber(get.e:match("%-(%d%d?)$"))
         local ey = tonumber(get.e:match("^(%d%d%d%d)"))
         local ec = utils.lastDayOfMonth(ey, em)
-        daterange = {        
+        daterange = {
             gte = get.s:gsub("%-","/").."/01 00:00:00",
             lte = get.e:gsub("%-","/").."/" .. ec .. " 23:59:59",
         }
@@ -355,7 +360,7 @@ function handle(r)
                         exclude = EXCLUDE
                     }
                 }
-            }, 
+            },
             query = {
                 bool = {
                     must = {
@@ -363,7 +368,7 @@ function handle(r)
                             range = {
                                 date = daterange
                             }
-                        }, 
+                        },
                         {
                             query_string = {
                                 default_field = "subject",
@@ -397,12 +402,12 @@ function handle(r)
       table.insert(t, r:clock() - tnow)
       tnow = r:clock()
     end
-    
+
     -- Get years active
     local NOWISH = math.floor(os.time()/600)
     local DATESPAN_KEY = "dateSpan:" .. NOWISH .. ":" .. get.list .. "@" .. get.domain
     local datespan = JSON.decode(r:ivm_get(DATESPAN_KEY) or "{}")
-    
+
     if not (datespan.pubfirst and datespan.publast) then
         local doc = elastic.raw {
             size = 0,
@@ -472,8 +477,8 @@ function handle(r)
         end
         if datespan.publast == nil then -- did not find any values
             local NOW = os.time()
-            datespan.publast = NOW 
-            datespan.pubfirst = NOW 
+            datespan.publast = NOW
+            datespan.pubfirst = NOW
         end
 
         -- find private min and max and store them if they could change the public ones
@@ -496,7 +501,7 @@ function handle(r)
                 end
             end
         end
- 
+
         r:ivm_set(DATESPAN_KEY, JSON.encode(datespan))
     end
 
@@ -525,7 +530,7 @@ function handle(r)
 
     datespan.lastYear = tonumber(os.date("!%Y", last))
     datespan.lastMonth = tonumber(os.date("!%m", last))
-    
+
     -- Debug time point 4
     if DEBUG then
       table.insert(t, r:clock() - tnow)
@@ -537,72 +542,93 @@ function handle(r)
     local emails = {}
     local emls = {}
     local senders = {}
-    
+
     local dhh = {}
-    
+    local total_hits = 0
+
     -- construct thread query
     local squery = {
-            _source = {'message-id','in-reply-to','from','subject','epoch','references','list_raw', 'private', 'attachments', 'body'},
-            query = {
-                bool = {
-                    must = {
-                        {
-                            range = {
-                                date = daterange
-                            }
-                        },
-                        sterm,
-                        {
-                            query_string = {
-                                default_field = "subject",
-                                query = qs
-                            }
+        _source = {'message-id','in-reply-to','from','subject','epoch','references','list_raw', 'private', 'attachments', 'body'},
+        query = {
+            bool = {
+                must = {
+                    {
+                        range = {
+                            date = daterange
                         }
+                    },
+                    sterm,
+                    {
+                        query_string = {
+                            default_field = "subject",
+                            query = qs
+                        }
+                    }
                 },
-                    must_not = {
-                        {
-                            query_string = {
-                                default_field = "subject",
-                                query = nqs
-                            }
+                must_not = {
+                    {
+                        query_string = {
+                            default_field = "subject",
+                            query = nqs
                         }
                     }
                 }
-            },
-            sort = {
-                {
-                    epoch = {
-                        order = "desc"
-                    }
-                }  
-            },
-            size = maxresults
-        }
-    
-    -- If max results limit is beyond the limit, we have to do a scroll to fetch it.
+            }
+        },
+        sort = {
+            {
+                epoch = {
+                    order = "desc"
+                }
+            }
+        },
+        size = per_page
+    }
+
+    -- If max results limit is beyond the limit, we have to do a scroll
     if maxresults > elastic.MAX_RESULT_WINDOW then
-        squery.size = elastic.MAX_RESULT_WINDOW -- limit the maximum batch sizes
+        -- First get total count
+        local count_query = {
+            query = squery.query,
+            size = 0
+        }
+        local count_result = elastic.raw(count_query)
+        total_hits = count_result.hits.total
+
+        -- Then do scroll logic...
+        squery.size = per_page
         local js, sid = elastic.scroll(squery)
-        while js and js.hits and js.hits.hits and #js.hits.hits > 0 do -- scroll as long as we get new results
+
+        local skip_batches = math.floor(offset / per_page)
+        for i = 1, skip_batches do
+            js, sid = elastic.scroll(sid)
+            if not (js and js.hits and js.hits.hits and #js.hits.hits > 0) then
+                break
+            end
+        end
+
+        if js and js.hits and js.hits.hits and #js.hits.hits > 0 then
             for k, v in pairs(js.hits.hits) do
                 table.insert(dhh, v)
             end
-            js, sid = elastic.scroll(sid)
         end
-        elastic.clear_scroll(sid) -- we're done with the sid, release it
-    -- otherwise, we can just do a standard raw query
+
+        elastic.clear_scroll(sid)
     else
+        -- Standard query
+        squery.from = offset
         local doc = elastic.raw(squery)
         dhh = doc.hits.hits
+        total_hits = doc.hits.total
     end
 
     -- Debug time point 5
     if DEBUG then
-      table.insert(t, r:clock() - tnow)
-      tnow = r:clock()
+    table.insert(t, r:clock() - tnow)
+    tnow = r:clock()
     end
-    
-    
+
+
     for k = #dhh, 1, -1 do
         local v = dhh[k]
         local email = v._source
@@ -635,10 +661,10 @@ function handle(r)
                     nest = 1,
                     epoch = email.epoch,
                     children = {
-                        
+
                     }
                 }
-                
+
                 if not irt or irt == JSON.null or #irt == 0 then
                     irt = ""
                 end
@@ -650,11 +676,11 @@ function handle(r)
                         end
                     end
                 end
-                
+
                 if not irt or irt == JSON.null or #irt == 0 then
                     irt = email.subject:gsub("^[a-zA-Z]+:%s+", "")
                 end
-                
+
                 -- If we can't match by in-reply-to or references, match/group by subject, ignoring Re:/Fwd:/etc
                 if not emails[irt] then
                     irt = email.subject:gsub("^[a-zA-Z]+:%s+", "")
@@ -668,7 +694,7 @@ function handle(r)
                 if not point and email.subject:match("^[A-Za-z]+:%s+") then  -- if this is a 'Re:' or 'Aw:' or 'Fwd:', try to find parent anyway
                     point = findSubject(emails, emls, irt, email.epoch, 30) -- at most, go back 30 days. if not, then they don't belong together...I guess
                 end
-                    
+
                 if point then
                     if point.nest < 50 then
                         point.nest = point.nest + 1
@@ -713,7 +739,7 @@ function handle(r)
             end
         end
     end
-    
+
     local allparts = 0 -- number of participants
     local top10 = {}
 
@@ -739,7 +765,7 @@ function handle(r)
             top10[k].email = top10[k].email:gsub("(%S+)@(%S+)", function(a,b) return a:sub(1,2) .. "..." .. "@" .. b end)
         end
     end
-    
+
     -- Debug time point 6
     if DEBUG then
       table.insert(t, r:clock() - tnow)
@@ -747,7 +773,7 @@ function handle(r)
     end
 
     sortEmail(threads)
-    
+
     -- Debug time point 7
     if DEBUG then
       table.insert(t, r:clock() - tnow)
@@ -785,9 +811,17 @@ function handle(r)
         listdata.squery = squery
         listdata.sdata = get
     end
-    
+
+    -- Add pagination metadata
+    listdata.pagination = {
+        page = page,
+        per_page = per_page,
+        total = total_hits,
+        total_pages = math.ceil(total_hits/per_page)
+    }
+
     r:puts(JSON.encode(listdata))
-    
+
     return cross.OK
 end
 
